@@ -1,4 +1,4 @@
-name: Build TeamPulse Android APK & Packages
+name: Build TeamPulse Android APK
 
 on:
   push:
@@ -8,14 +8,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-android:
+  build-android-apk:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -31,41 +31,65 @@ jobs:
         with:
           packages: 'platforms;android-33 build-tools;33.0.2 ndk;25.1.8937393'
 
-      - name: Install System & Build Dependencies
+      - name: Install System Build Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y git zip unzip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libsqlite3-dev cmake libffi-dev libssl-dev
-          python -m pip install --upgrade pip setuptools wheel
-          pip install PySide6 shiboken6 firebase-admin buildozer cython briefcase
+          sudo apt-get install -y git zip unzip openjdk-17-jdk cmake ninja-build libffi-dev libssl-dev
 
-      - name: Build Android APK
+      - name: Install PySide6 & Deploy Tools
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install PySide6 shiboken6 firebase-admin nuitka buildozer cython
+
+      - name: Configure Spec for Cloud Android Build
+        run: |
+          python -c "
+          import configparser
+          config = configparser.ConfigParser()
+          config.read('pysidedeploy.spec')
+          if not config.has_section('android'):
+              config.add_section('android')
+          config.set('android', 'sdk_path', '${{ env.ANDROID_HOME }}')
+          config.set('android', 'ndk_path', '${{ env.ANDROID_HOME }}/ndk/25.1.8937393')
+          config.set('android', 'package_name', 'org.teampulse.app')
+          config.set('android', 'permissions', 'INTERNET, ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION')
+          config.set('android', 'arch', 'aarch64')
+          with open('pysidedeploy.spec', 'w') as f:
+              config.write(f)
+          "
+
+      - name: Execute Android APK Compilation
         env:
           ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
           ANDROID_NDK_ROOT: ${{ env.ANDROID_HOME }}/ndk/25.1.8937393
         run: |
-          mkdir -p bin deployment dist
+          mkdir -p deployment bin dist
           
-          # Initialize Buildozer spec if not present
-          if [ ! -f "buildozer.spec" ]; then
-            buildozer init
-            sed -i 's/title = My Application/title = TeamPulse/' buildozer.spec
-            sed -i 's/package.name = myapp/package.name = teampulse/' buildozer.spec
-            sed -i 's/package.domain = org.test/package.domain = org.teampulse/' buildozer.spec
-            sed -i 's/requirements = python3,kivy/requirements = python3,pyside6,firebase_admin/' buildozer.spec
-            sed -i 's/# android.permissions = INTERNET/android.permissions = INTERNET, ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION/' buildozer.spec
+          # 1. Attempt PySide6 Android deploy
+          pyside6-android-deploy --config-file pysidedeploy.spec || pyside6-deploy -c pysidedeploy.spec || true
+
+          # 2. Buildozer Fallback for standalone APK compilation if spec is incomplete
+          if [ ! -f "deployment/*.apk" ] && [ ! -f "bin/*.apk" ]; then
+            if [ ! -f "buildozer.spec" ]; then
+              buildozer init
+              sed -i 's/title = My Application/title = TeamPulse/' buildozer.spec
+              sed -i 's/package.name = myapp/package.name = teampulse/' buildozer.spec
+              sed -i 's/package.domain = org.test/package.domain = org.teampulse/' buildozer.spec
+              sed -i 's/requirements = python3,kivy/requirements = python3,pyside6,firebase_admin/' buildozer.spec
+              sed -i 's/# android.permissions = INTERNET/android.permissions = INTERNET, ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION/' buildozer.spec
+            fi
+            buildozer -v android debug || true
           fi
 
-          # Execute Buildozer Android compilation
-          buildozer -v android debug || true
-
-      - name: Find and Upload APK & Package Artifacts
+      - name: Upload Generated APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: TeamPulse-Android-APK
           path: |
             bin/*.apk
-            **/*.apk
-            build/**/*.apk
+            deployment/*.apk
             deployment/**/*.apk
-            dist/*
+            build/**/*.apk
+            dist/*.apk
+            **/*.apk
           if-no-files-found: warn
