@@ -1,0 +1,31 @@
+# Credentials & Secrets
+firebase_credentials.json
+*.json.secret
+
+# Build and deployment outputs
+dist/
+build/
+deployment/
+*.build/
+*.dist/
+
+# Python bytecode & environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Large binary wheels
+*.whl
+*.whl.1
+
+# SQLite local dev databases
+*.db
+
+# Temporary files
+scratch/
+.system_generated/
+nuitka-crash-report.xml

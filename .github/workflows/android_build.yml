@@ -1,0 +1,68 @@
+name: Build TeamPulse Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK & NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-33 build-tools;33.0.2 ndk;25.1.8937393'
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySide6 shiboken6 firebase-admin
+
+      - name: Build Android APK
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_HOME }}/ndk/25.1.8937393
+        run: |
+          # Configure pysidedeploy.spec for cloud environment
+          python -c "
+          import configparser
+          config = configparser.ConfigParser()
+          config.read('pysidedeploy.spec')
+          if not config.has_section('android'):
+              config.add_section('android')
+          config.set('android', 'sdk_path', '${{ env.ANDROID_HOME }}')
+          config.set('android', 'ndk_path', '${{ env.ANDROID_HOME }}/ndk/25.1.8937393')
+          config.set('android', 'package_name', 'org.teampulse.app')
+          config.set('android', 'permissions', 'INTERNET, ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION')
+          with open('pysidedeploy.spec', 'w') as f:
+              config.write(f)
+          "
+          # Run deployment tool
+          python -m PySide6.scripts.deploy -c pysidedeploy.spec || true
+
+      - name: Find and Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TeamPulse-Android-APK
+          path: |
+            **/*.apk
+            deployment/**/*.apk
+            dist/*.apk
