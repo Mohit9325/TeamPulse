@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     container:
       image: kivy/buildozer:latest
     steps:
@@ -15,6 +16,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: false
+          persist-credentials: false
 
       - name: Fix Git Directory Permissions
         run: |
