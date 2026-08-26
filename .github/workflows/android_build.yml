@@ -16,9 +16,11 @@ jobs:
 
       - name: Fix Git Directory Permissions
         run: |
-          git config --global --add safe.directory /__w/TeamPulse/TeamPulse
+          git config --global --add safe.directory '*'
 
       - name: Build Android APK
+        env:
+          BUILDOZER_ALLOW_ROOT: "1"
         run: |
           buildozer -v android debug
 
