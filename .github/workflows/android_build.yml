@@ -12,11 +12,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build with Buildozer
-        uses: kivy/buildozer-action@v0.3.0
-        with:
-          command: buildozer android debug
-          buildozer_version: stable
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git python3-pip build-essential libltdl-dev openjdk-17-jdk autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libffi-dev
+
+      - name: Install Buildozer
+        run: |
+          python3 -m pip install --upgrade pip buildozer cython
+
+      - name: Run Buildozer
+        run: |
+          buildozer -v android debug
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
