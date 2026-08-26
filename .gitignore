@@ -4,6 +4,8 @@ firebase_credentials.json
 *.json.secret
 
 # Build and deployment outputs
+.buildozer/
+bin/
 dist/
 build/
 deployment/
