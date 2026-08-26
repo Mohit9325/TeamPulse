@@ -1,4 +1,4 @@
-# force unblock queue
+# Ensure submodules: false for checkout step
 name: Android Build CI/CD
 
 on:
