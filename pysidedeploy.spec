@@ -1,52 +1,72 @@
 [app]
+
 # title of your application
 title = TeamPulse
+
 # project name
 project_name = teampulse
+
 # app source directory
 project_dir = .
+
 # application entry point
 entry_point = main.py
+
 # icon path
-icon = 
-input_file = pysidedeploy.spec
+icon = logo.png
+input_file = main.py
 exec_directory = .
 
 [python]
+
 # python executable
 python_path = C:\Users\mohit\AppData\Local\Programs\Python\Python313\python.exe
+
 # python packages directory
 packages_path = C:\Users\mohit\AppData\Local\Programs\Python\Python313\Lib\site-packages
-packages = PySide6, firebase_admin
+packages = PySide6,firebase_admin
 
 [qt]
+
 # qml files directory
-qml_files = main.qml
+qml_files = main.qml,EmployeeView.qml,ManagerView.qml
+
 # excluded qml plugin modules
-excluded_qml_plugins = 
+excluded_qml_plugins = QtCharts,QtSensors,QtWebEngine
+
 # qt modules
-modules = Core, Gui, Qml, Quick, Controls
+modules = Core,Qml,Quick,QuickControls2,Widgets
+
 # qt plugins
-plugins = 
+plugins = qmllint,qmltooling,scenegraph,styles,vectorimageformats
 
 [nuitka]
+
 # nuitka build mode (onefile / standalone)
-mode = onefile
+mode = standalone
+
 # extra nuitka options (automatic download prompt confirmation)
-extra_args = --assume-yes-for-downloads
+extra_args = --assume-yes-for-downloads --enable-plugin=pyside6
 
 [android]
+
 # path to android ndk
 ndk_path = 
+
 # path to android sdk
 sdk_path = 
+
 # android permissions required by your app
-permissions = INTERNET, ACCESS_FINE_LOCATION, ACCESS_COARSE_LOCATION
+permissions = INTERNET,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION
+
 # package name
 package_name = org.teampulse.app
 
 [build]
+
 # extra modules to include
 modules = 
+
 # extra data files to package
-extra_data = main.qml, database_manager.py, models.py
+extra_data = main.qml,EmployeeView.qml,ManagerView.qml,logo.png,firebase_credentials.json,database_manager.py,models.py,backend.py
+
