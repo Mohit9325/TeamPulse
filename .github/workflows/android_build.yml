@@ -6,23 +6,22 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    build-android:
+      name: Build APK for Android
+      runs-on: ubuntu-latest
+      steps:
+        - name: Checkout Code
+          uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+        - name: Build with Buildozer
+          uses: ArtemSBulgakov/buildozer-action@v1
+          id: buildozer
+          with:
+            buildozer_version: stable
+            command: buildozer android debug
 
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyside6 shiboken6 buildozer
-
-      - name: Run Build / Check Status
-        run: |
-          echo "Preparing environment for build..."
-          python -c "print('TeamPulse CI pipeline initialized successfully')"
+        - name: Upload APK Artifact
+          uses: actions/upload-artifact@v4
+          with:
+            name: package-apk
+            path: ${{ steps.buildozer.outputs.filename }}
