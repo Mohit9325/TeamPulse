@@ -14,7 +14,7 @@ entry_point = main.py
 
 # icon path
 icon = logo.png
-input_file = main.py
+input_file = pysidedeploy.spec
 exec_directory = .
 
 [python]
@@ -24,7 +24,7 @@ python_path = C:\Users\mohit\AppData\Local\Programs\Python\Python313\python.exe
 
 # python packages directory
 packages_path = C:\Users\mohit\AppData\Local\Programs\Python\Python313\Lib\site-packages
-packages = PySide6,firebase_admin
+packages = PySide6
 
 [qt]
 
@@ -68,5 +68,5 @@ package_name = org.teampulse.app
 modules = 
 
 # extra data files to package
-extra_data = main.qml,EmployeeView.qml,ManagerView.qml,logo.png,firebase_credentials.json,database_manager.py,models.py,backend.py
+extra_data = main.qml,EmployeeView.qml,ManagerView.qml,logo.png,database_manager.py,models.py,backend.py
 

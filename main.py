@@ -1,618 +1,666 @@
 import os
-import sys
-
-from pathlib import Path
-from datetime import datetime
-
-from PySide6.QtCore import Qt, QObject, Slot, Signal, Property, QTimer
-from PySide6.QtWidgets import QApplication
-from PySide6.QtQml import QQmlApplicationEngine
+import json
+from kivy.app import App
+from kivy.lang import Builder
+from kivy.uix.screenmanager import ScreenManager, Screen
+from kivy.properties import StringProperty, BooleanProperty, NumericProperty, ObjectProperty, ListProperty
+from kivy.clock import Clock
+from kivy.event import EventDispatcher
+from kivy.metrics import dp
+from kivy.uix.button import Button
+from kivy.uix.textinput import TextInput
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.popup import Popup
 
 from database_manager import DatabaseManager
-from models import EmployeeStatusModel, ActivityFeedModel, TaskHistoryModel, AssignedTasksModel
+from datetime import datetime
 
-class TeamPulseEngine(QObject):
-    # Signals to broadcast state changes asynchronously to the main thread
-    activityLogged = Signal(str, str) # eventText, timestamp
-    employeeStatusChanged = Signal(int, str, str, list) # emp_id, task, status, completed_list
-    employeeTimerUpdated = Signal(int, str) # emp_id, timer_text
-    metricsUpdated = Signal(int, int, int) # active, paused, completed
-    currentTimeChanged = Signal()
-    employeesSynced = Signal(list)
-    
-    def __init__(self, db_manager, parent=None):
-        super().__init__(parent)
+class TeamPulseEngine(EventDispatcher):
+    def __init__(self, db_manager, **kwargs):
+        self.register_event_type('on_activity_logged')
+        self.register_event_type('on_employee_status_changed')
+        self.register_event_type('on_employee_timer_updated')
+        self.register_event_type('on_metrics_updated')
+        self.register_event_type('on_employees_synced')
+        self.register_event_type('on_activity_feed_changed')
+        super().__init__(**kwargs)
+        
         self.db = db_manager
-        # Initialize empty state
         self.employees = {}
-        self.completed_today = 0
-        self._current_time_str = datetime.now().strftime("%I:%M %p")
+        self.db.signals.bind(
+            on_employee_status_changed=self._on_db_users_updated,
+            on_activity_feed_changed=self._on_db_activity_updated
+        )
+        Clock.schedule_interval(self._on_ui_tick, 1.0)
         
-        # Connect Firestore background signals to main thread slots
-        self.db.signals.employeeStatusChanged.connect(self._on_firestore_users_updated)
-        self.db.signals.activityFeedChanged.connect(self._on_firestore_activity_updated)
-        
-        # 1-second UI Heartbeat Timer
-        self.ui_timer = QTimer(self)
-        self.ui_timer.setInterval(1000)
-        self.ui_timer.timeout.connect(self._on_ui_tick)
-        self.ui_timer.start()
+        # Initial boot fetch
+        self.db._broadcast_employees()
+        self.db._broadcast_activity()
 
-    @Property(str, notify=currentTimeChanged)
-    def currentTime(self):
-        return self._current_time_str
-
-    @Slot()
-    def _on_ui_tick(self):
-        new_time = datetime.now().strftime("%I:%M %p")
-        if new_time != self._current_time_str:
-            self._current_time_str = new_time
-            self.currentTimeChanged.emit()
-            
-        # Update elapsed time for active employees
+    def _on_ui_tick(self, dt):
         for emp_id, emp_data in self.employees.items():
-            if emp_data["status"] == "Active":
-                emp_data["acc_sec"] += 1
-                self.employeeTimerUpdated.emit(emp_id, self._format_time(emp_data["acc_sec"]))
+            if emp_data['status'] == 'Active' and emp_data['task'] != 'None':
+                emp_data['acc_sec'] += 1
+                self.db.update_user_status(emp_id, 'Active', emp_data['acc_sec'])
+                
+                allocated = emp_data.get('allocated_minutes', 0)
+                if allocated > 0:
+                    remaining = (allocated * 60) - emp_data['acc_sec']
+                    if remaining <= 0:
+                        task_id = self.db.get_active_task_id(emp_id)
+                        if task_id:
+                            self.db.end_task(task_id, emp_id, emp_data['acc_sec'], "Auto-completed (Time up)")
+                            self.dispatch('on_employee_timer_updated', emp_id, "00:00:00")
+                        continue
+                    else:
+                        time_str = self._format_time(remaining)
+                else:
+                    time_str = self._format_time(emp_data['acc_sec'])
+                    
+                self.dispatch('on_employee_timer_updated', emp_id, time_str)
+            elif emp_data['status'] in ('On Break', 'Paused') and emp_data['task'] != 'None':
+                allocated = emp_data.get('allocated_minutes', 0)
+                if allocated > 0:
+                    remaining = max(0, (allocated * 60) - emp_data['acc_sec'])
+                    time_str = self._format_time(remaining)
+                else:
+                    time_str = self._format_time(emp_data['acc_sec'])
+                self.dispatch('on_employee_timer_updated', emp_id, time_str)
 
-    @Slot()
-    def initialize_heavy_data(self):
-        """No more mock data or polling timers needed; Firestore streams the initial state."""
-        print("Engine: Ready to receive Firestore data streams.")
-
-    @Slot(list)
-    def _on_firestore_users_updated(self, users_data):
-        """Runs safely on the main thread when Firestore pushes a user update"""
+    def _on_db_users_updated(self, instance, users_data):
         self.employees.clear()
-        
         sync_list = []
         for user in users_data:
-            try:
-                emp_id = int(user.get('id', 0))
-            except ValueError:
-                continue
-                
-            firestore_acc = user.get('acc_sec', 0)
-            existing_acc = self.employees.get(emp_id, {}).get('acc_sec', 0)
-            current_task = user.get('current_task', 'None')
-            existing_task = self.employees.get(emp_id, {}).get('task', 'None')
-            
-            # Preserve locally accumulated seconds if same task is running or paused
-            if current_task == existing_task and current_task != 'None':
-                acc_sec = max(firestore_acc, existing_acc)
-            else:
-                acc_sec = firestore_acc
-
+            emp_id = user['id']
+            allocated = user.get('allocated_minutes', 0) or 0
             self.employees[emp_id] = {
-                "name": user.get('name'),
-                "status": user.get('status', 'Offline'),
-                "task": current_task,
-                "acc_sec": acc_sec,
-                "completed_list": user.get('completed_list', []),
-                "role": user.get('role', 'employee')
+                "name": user['name'],
+                "status": user['status'],
+                "task": user['current_task'],
+                "acc_sec": user['acc_sec'],
+                "completed_list": user['completed_list'],
+                "role": user['role'],
+                "department": user.get('department') or 'N/A',
+                "allocated_minutes": allocated
             }
-            
-            if user.get("role") != "manager":
-                sync_list.append({
-                    "id": emp_id,
-                    "name": user.get('name', 'Unknown'),
-                    "currentTask": current_task,
-                    "status": user.get('status', 'Offline'),
-                    "timer": self._format_time(acc_sec),
-                    "completed_list": user.get('completed_list', [])
-                })
-            
-            # Broadcast to local models
-            self.employeeStatusChanged.emit(emp_id, self.employees[emp_id]["task"], self.employees[emp_id]["status"], self.employees[emp_id]["completed_list"])
-            self.employeeTimerUpdated.emit(emp_id, self._format_time(self.employees[emp_id]["acc_sec"]))
-            
-        self.employeesSynced.emit(sync_list)
+            if user['role'] != 'manager':
+                sync_list.append(user)
+            self.dispatch('on_employee_status_changed', emp_id, user['current_task'], user['status'], user['completed_list'])
+            if allocated > 0:
+                rem = max(0, (allocated * 60) - user['acc_sec'])
+                t_display = self._format_time(rem)
+            else:
+                t_display = self._format_time(user['acc_sec'])
+            self.dispatch('on_employee_timer_updated', emp_id, t_display)
+        self.dispatch('on_employees_synced', sync_list)
         self._recalculate_metrics()
 
-    @Slot(list)
-    def _on_firestore_activity_updated(self, activity_data):
-        """Runs safely on the main thread when Firestore pushes a new activity log"""
-        # (Optional) You can clear the feed model and rebuild, or just process new ones.
-        pass # In this design, we will just rely on the existing direct connection or use this if needed
+    def _on_db_activity_updated(self, instance, activity_data):
+        self.dispatch('on_activity_feed_changed', activity_data)
 
     def _recalculate_metrics(self):
         emp_list = [e for e in self.employees.values() if e.get("role") != "manager"]
         active = sum(1 for e in emp_list if e.get("status") in ["Active", "in_progress", "In Progress"])
         paused = sum(1 for e in emp_list if e.get("status") in ["Paused", "on_break", "On Break", "Break"])
-        
-        # Total completed tasks across all non-manager employees
         total_completed = sum(len(e.get("completed_list", [])) for e in emp_list)
-        
-        self.metricsUpdated.emit(active, paused, total_completed)
+        self.dispatch('on_metrics_updated', active, paused, total_completed)
 
     def _format_time(self, seconds):
-        h = seconds // 3600
-        m = (seconds % 3600) // 60
-        s = seconds % 60
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
         return f"{h:02d}:{m:02d}:{s:02d}"
 
-    def set_employee_state(self, emp_id, status, task="None"):
-        """Delegate to Firestore which will then trigger the signal loop"""
-        # Find active task id if any? In database_manager we made simple methods
-        self.db.update_user_status(emp_id, status)
-        if status == "Offline":
-            self.db.update_user_status(emp_id, status, acc_sec=0)
-            
-    def log_activity(self, message):
-        timestamp = datetime.now().strftime("%I:%M %p")
-        # Write to firestore instead of local emit
-        self.db.log_activity(message, timestamp)
+    def on_activity_logged(self, *args): pass
+    def on_employee_status_changed(self, *args): pass
+    def on_employee_timer_updated(self, *args): pass
+    def on_metrics_updated(self, *args): pass
+    def on_employees_synced(self, *args): pass
+    def on_activity_feed_changed(self, *args): pass
 
+# Custom Widget Models
+class CorporateButton(Button):
+    bg_color = ListProperty([0.827, 0.184, 0.184, 1])
 
-class AuthController(QObject):
-    loginResult = Signal(str, str, int) # role, name, user_id
-    error = Signal(str)
+class MetricCard(BoxLayout):
+    label_text = StringProperty('')
+    value_text = StringProperty('')
+    accent = ListProperty([0.827, 0.184, 0.184, 1])
 
-    def __init__(self, db_manager):
-        super().__init__()
-        self.db = db_manager
+class EmployeeCard(BoxLayout):
+    emp_id = NumericProperty(0)
+    emp_name = StringProperty('')
+    emp_status = StringProperty('Offline')
+    emp_task = StringProperty('')
+    emp_timer = StringProperty('')
+    
+    def status_color(self):
+        if self.emp_status == 'Active':
+            return [0.298, 0.686, 0.314, 1]
+        elif self.emp_status in ('On Break', 'Paused'):
+            return [1.0, 0.596, 0.0, 1]
+        return [0.42, 0.447, 0.502, 1]
 
-    @Slot(str, str)
-    def login(self, username, password):
-        user = self.db.authenticate_user(username, password)
-        if user:
-            user_id, role, name = user
-            self.loginResult.emit(role, name, int(user_id))
-        else:
-            self.error.emit("Invalid credentials.")
+class ActivityItem(BoxLayout):
+    message = StringProperty('')
+    timestamp = StringProperty('')
 
-    @Slot(str)
-    def request_password_reset(self, emp_id):
-        self.db.request_password_reset(emp_id)
+class AssignedTaskItem(BoxLayout):
+    title = StringProperty('')
+    description = StringProperty('')
+    allocated_time = NumericProperty(0)
+    task_id = NumericProperty(0)
+    
+    def start_assigned_task(self):
+        app = App.get_running_app()
+        if hasattr(app, 'employee_screen'):
+            app.employee_screen.start_assigned_task(self.task_id, self.allocated_time, self.title)
 
+class CompletedTaskItem(BoxLayout):
+    task_title = StringProperty('')
+    task_duration = StringProperty('')
+    task_date = StringProperty('')
 
+# Popups
+class CompletionNotesPopup(Popup):
+    def do_complete(self, notes):
+        app = App.get_running_app()
+        app.employee_screen.execute_end_task(notes)
+        self.dismiss()
 
-import ctypes
-class LASTINPUTINFO(ctypes.Structure):
-    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+class AddEmployeePopup(Popup):
+    def do_add(self, name, username, department, password):
+        if name and username and password:
+            App.get_running_app().db.create_employee(name, username, password, department)
+        self.dismiss()
 
-def get_idle_time():
-    lii = LASTINPUTINFO()
-    lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
-    if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
-        millis = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
-        return millis / 1000.0
-    return 0
-
-class EmployeeController(QObject):
-    hasActiveTaskChanged = Signal()
-    isTaskPausedChanged = Signal()
-    activeTimerTextChanged = Signal()
-    totalHoursChanged = Signal()
-    autoPaused = Signal()
-    assignedTasksSync = Signal(list)
-    statsChanged = Signal()
-
-    def __init__(self, engine, history_model, emp_id=2):
-        super().__init__()
-        self.engine = engine
-        self.emp_id = emp_id
-        self._history_model = history_model
-        self._assigned_tasks_model = AssignedTasksModel()
-        self._recent_history_model = TaskHistoryModel()
-        self._total_seconds = 0
-        
-        self.engine.employeeTimerUpdated.connect(self._on_global_timer)
-        self.engine.employeeStatusChanged.connect(self._on_status_changed)
-        self.assignedTasksSync.connect(self._on_assigned_tasks_sync)
-
-        self.idle_timer = QTimer(self)
-        self.idle_timer.setInterval(60000)
-        self.idle_timer.timeout.connect(self._check_idle)
-        self.idle_timer.start()
-
-    @Slot()
-    def _check_idle(self):
-        if self.hasActiveTask and not self.isTaskPaused:
-            if get_idle_time() > 15 * 60:
-                self.pauseTask()
-                self.autoPaused.emit()
-
-    @Slot(list)
-    def _on_assigned_tasks_sync(self, tasks):
-        self._assigned_tasks_model.setTasks(tasks)
-
-    @Slot(int)
-    def loadUser(self, emp_id):
-        self.emp_id = emp_id
-        
-        # Load tasks for today
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        tasks = self.engine.db.get_user_tasks_for_date(self.emp_id, date_str)
-        history_list = []
-        total_sec = 0
-        for task in tasks:
-            _, t_type, notes, status, start, end, acc_sec = task
-            if status == "Completed":
-                total_sec += acc_sec
-                history_list.append({"taskType": t_type, "notes": notes, "duration": self.engine._format_time(acc_sec)})
-        self._history_model.setHistory(history_list)
-        self._total_seconds = total_sec
-        
-        # Trigger initial fetch and listen for assigned tasks
-        pending_initial = self.engine.db.get_pending_assigned_tasks(self.emp_id)
-        self._assigned_tasks_model.setTasks(pending_initial)
-        self.engine.db.listen_to_assigned_tasks(self.emp_id, lambda tasks: self.assignedTasksSync.emit(tasks))
-        
-        recent = self.engine.db.get_recent_completed_tasks(self.emp_id)
-        self._recent_history_model.setHistory(recent)
-
-        self.hasActiveTaskChanged.emit()
-        self.isTaskPausedChanged.emit()
-        self.activeTimerTextChanged.emit()
-        self.totalHoursChanged.emit()
-
-    @Slot(int, str)
-    def _on_global_timer(self, emp_id, timer_str):
-        if emp_id == self.emp_id:
-            self.activeTimerTextChanged.emit()
-
-    @Slot(int, str, str, list)
-    def _on_status_changed(self, emp_id, task, status, completed_list):
-        if emp_id == self.emp_id:
-            self.hasActiveTaskChanged.emit()
-            self.isTaskPausedChanged.emit()
-
-    @Slot(str, int, str)
-    def start_assigned_task(self, task_id, allocated_time, title):
-        # Mark as in_progress
-        self.engine.db.db.collection('assigned_tasks').document(task_id).set({
-            'status': 'in_progress'
-        }, merge=True)
-        
-        # Stop current task if any
-        if self.hasActiveTask:
-            self.endTask()
-            
-        # Start new task
-        self.engine.db.start_task(self.emp_id, title)
-        
-        # Note: 'allocated_time' is now passed, we could store it to a local property for a countdown timer, 
-        # but for now we'll just log it or pass it if the backend supports it.
-        emp_name = self.engine.employees[self.emp_id]["name"] if self.emp_id in self.engine.employees else "Employee"
-        self.engine.db.log_activity(f"▶️ {emp_name} started assigned task: {title} ({allocated_time}m)", datetime.now().strftime("%I:%M %p"))
-        
-        self.hasActiveTaskChanged.emit()
-        self.isTaskPausedChanged.emit()
-
-    @Slot(str, str)
-    def startTask(self, task_type, notes):
-        if self.emp_id not in self.engine.employees: return
-        emp_name = self.engine.employees[self.emp_id]["name"]
-        
-        # Real Firestore mutation
-        self.engine.db.start_task(self.emp_id, task_type, notes)
-        self.engine.db.log_activity(f"▶️ {emp_name} started: {task_type}", datetime.now().strftime("%I:%M %p"))
-
-    @Slot()
-    def pauseTask(self):
-        if self.emp_id not in self.engine.employees: return
-        emp_name = self.engine.employees[self.emp_id]["name"]
-        curr_acc_sec = self.engine.employees[self.emp_id]["acc_sec"]
-        
-        self.engine.db.update_user_status(self.emp_id, "Paused", acc_sec=curr_acc_sec)
-        self.engine.db.log_activity(f"⏸️ {emp_name} paused task", datetime.now().strftime("%I:%M %p"))
-
-    @Slot()
-    def resumeTask(self):
-        if self.emp_id not in self.engine.employees: return
-        emp_name = self.engine.employees[self.emp_id]["name"]
-        curr_acc_sec = self.engine.employees[self.emp_id]["acc_sec"]
-        
-        self.engine.db.update_user_status(self.emp_id, "Active", acc_sec=curr_acc_sec)
-        self.engine.db.log_activity(f"▶️ {emp_name} resumed task", datetime.now().strftime("%I:%M %p"))
-
-    @Slot()
-    def endTask(self):
-        self.complete_task_with_notes("Completed")
-
-    @Slot(str)
-    def complete_task_with_notes(self, notes="Completed"):
-        if self.emp_id not in self.engine.employees: return
-        emp_name = self.engine.employees[self.emp_id]["name"]
-        task = self.engine.employees[self.emp_id]["task"]
-        sec = self.engine.employees[self.emp_id]["acc_sec"]
-        
-        duration_text = self.engine._format_time(sec)
-        self._total_seconds += sec
-        
-        task_id = self.engine.db.get_active_task_id(self.emp_id)
-        if task_id:
-            self.engine.db.end_task(task_id, self.emp_id, sec, notes=notes)
-            
-        self._history_model.addTask(task, notes, duration_text)
-        note_str = f" ({notes})" if notes and notes != "Completed" else ""
-        self.engine.db.log_activity(f"✅ {emp_name} completed: {task} ({duration_text}){note_str}", datetime.now().strftime("%I:%M %p"))
-        self.totalHoursChanged.emit()
-        self.statsChanged.emit()
-
-    @Slot(int, str)
-    def request_task_extension(self, extra_minutes, reason):
-        self.engine.db.request_task_extension(self.emp_id, extra_minutes, reason)
-
-    @Property(str, notify=statsChanged)
-    def completedTasksCount(self):
-        stats = self.engine.db.get_productivity_stats(self.emp_id)
-        return stats["total_completed"]
-
-    @Property(str, notify=statsChanged)
-    def avgTaskTimeText(self):
-        stats = self.engine.db.get_productivity_stats(self.emp_id)
-        return stats["avg_time"]
-
-    @Property(str, notify=statsChanged)
-    def adherenceScoreText(self):
-        stats = self.engine.db.get_productivity_stats(self.emp_id)
-        return stats["adherence"]
-
-    @Slot(str, str, str, result=bool)
-    def update_employee_password(self, emp_id, current_pw, new_pw):
-        return self.engine.db.update_employee_password(emp_id, current_pw, new_pw)
-
-    @Property(bool, notify=hasActiveTaskChanged)
-    def hasActiveTask(self):
-        if self.emp_id not in self.engine.employees: return False
-        return self.engine.employees[self.emp_id]["status"] in ["Active", "Paused"]
-
-    @Property(bool, notify=isTaskPausedChanged)
-    def isTaskPaused(self):
-        if self.emp_id not in self.engine.employees: return False
-        return self.engine.employees[self.emp_id]["status"] == "Paused"
-
-    @Property(str, notify=activeTimerTextChanged)
-    def activeTimerText(self):
-        if self.emp_id not in self.engine.employees: return "00:00:00"
-        sec = self.engine.employees[self.emp_id]["acc_sec"]
-        return self.engine._format_time(sec)
-
-    @Property(str, notify=totalHoursChanged)
-    def totalHoursTodayText(self):
-        h, rem = divmod(self._total_seconds, 3600)
-        m, s = divmod(rem, 60)
-        if h > 0:
-            return f"{h}h {m}m"
-        return f"{m}m {s}s"
-
-    @Property(str, notify=hasActiveTaskChanged)
-    def employeeName(self):
-        if self.emp_id in self.engine.employees:
-            return self.engine.employees[self.emp_id]["name"]
-        return "Employee"
-
-    @Property(str, notify=hasActiveTaskChanged)
-    def employeeStatus(self):
-        if self.emp_id in self.engine.employees:
-            return self.engine.employees[self.emp_id]["task"]
-        return "None"
-
-    @Property(str, notify=hasActiveTaskChanged)
-    def employeeIdString(self):
-        return f"EMP-{self.emp_id:04d}"
-
-    @Property(QObject, constant=True)
-    def assignedTasksModel(self):
-        return self._assigned_tasks_model
-        
-    @Property(QObject, constant=True)
-    def recentTaskHistoryModel(self):
-        return self._recent_history_model
-
-    @Property(QObject, constant=True)
-    def taskHistoryModel(self):
-        return self._history_model
-
-class ManagerController(QObject):
-    metricsChanged = Signal()
-
-    def __init__(self, engine, emp_model, feed_model):
-        super().__init__()
-        self.engine = engine
-        self._emp_model = emp_model
-        self.feed_model = feed_model
-        self._employee_history_model = TaskHistoryModel()
-        self._employee_history_model.setParent(self)
-        self._manager_pending_tasks_model = AssignedTasksModel()
-        self._manager_pending_tasks_model.setParent(self)
-        
-        self.active_count = 1
-        self.paused_count = 1
-        self.completed_count = 15
-
-        # Bind to engine signals
-        self.engine.employeeStatusChanged.connect(self._emp_model.updateEmployeeStatus)
-        self.engine.employeeTimerUpdated.connect(self._emp_model.updateEmployeeTimer)
-        self.engine.employeesSynced.connect(self._emp_model.syncEmployees)
-        self.engine.metricsUpdated.connect(self._on_metrics_updated)
-        
-        # Bind directly to Firestore feed signal
-        self.engine.db.signals.activityFeedChanged.connect(self._on_feed_updated)
-
-    @Slot(list)
-    def _on_feed_updated(self, activity_data):
-        # In a real app we'd carefully diff, but we can just clear and add or rely on the model API
-        self.feed_model._events.clear()
-        self.feed_model.beginResetModel()
-        for doc in reversed(activity_data): # Show newest at top depending on how model displays it
-            self.feed_model._events.insert(0, {"event": doc.get('message'), "time": doc.get('timestamp')})
-        self.feed_model.endResetModel()
-
-    @Slot(str, str)
-    def reset_employee_password(self, emp_id, new_password):
-        self.engine.db.manager_reset_password(emp_id, new_password)
-
-    @Slot(int, int, int)
-    def _on_metrics_updated(self, active, paused, completed):
-        self.active_count = active
-        self.paused_count = paused
-        self.completed_count = completed
-        self.metricsChanged.emit()
-
-    @Property(int, notify=metricsChanged)
-    def activeNow(self): return self.active_count
-
-    @Property(int, notify=metricsChanged)
-    def onBreak(self): return self.paused_count
-
-    @Property(int, notify=metricsChanged)
-    def completedToday(self): return self.completed_count
-
-    @Property(int, notify=metricsChanged)
-    def activeCount(self): return self.active_count
-
-    @Property(int, notify=metricsChanged)
-    def breakCount(self): return self.paused_count
-
-    @Property(int, notify=metricsChanged)
-    def completedCount(self): return self.completed_count
-
-    @Property(QObject, constant=True)
-    def employeeListModel(self):
-        return self._emp_model
-
-    @Property(QObject, constant=True)
-    def activityFeedModel(self):
-        return self.feed_model
-
-    @Property(QObject, constant=True)
-    def employeeHistoryModel(self):
-        return self._employee_history_model
-
-    @Property(QObject, constant=True)
-    def managerCompletedTasksModel(self):
-        return self._employee_history_model
-
-    @Property(QObject, constant=True)
-    def managerPendingTasksModel(self):
-        return self._manager_pending_tasks_model
-
-    @Slot(int)
-    def fetch_employee_history(self, emp_id):
-        recent = self.engine.db.get_recent_completed_tasks(str(emp_id), limit=20)
-        self._employee_history_model.setHistory(recent)
-        
-        pending = self.engine.db.get_pending_assigned_tasks(str(emp_id))
-        self._manager_pending_tasks_model.setTasks(pending)
-
-    @Property(list, notify=metricsChanged)
-    def activeDetailsList(self):
-        return [{"title": emp["name"], "subtitle": emp["task"]} for emp in self.engine.employees.values() if emp["status"] == "Active"]
-
-    @Property(list, notify=metricsChanged)
-    def breakDetailsList(self):
-        return [{"title": emp["name"], "subtitle": emp["task"]} for emp in self.engine.employees.values() if emp["status"] == "Paused"]
-
-    @Property(list, notify=metricsChanged)
-    def completedDetailsList(self):
-        res = []
-        for emp in self.engine.employees.values():
-            for task in emp["completed_list"]:
-                res.append({"title": f"✅ {emp['name']}", "subtitle": task})
-        
-        # Add mock completed tasks to match the '15' default count
-        if len(res) == 0:
-            for i in range(15):
-                res.append({"title": "✅ System", "subtitle": f"Archived Task #{i+1}"})
+class AssignTaskPopup(Popup):
+    emp_id = NumericProperty(0)
+    def do_assign(self, title, desc, minutes, priority="Medium"):
+        print(f"[AssignTaskPopup] Assigning task to emp_id={self.emp_id}, Title='{title}', Desc='{desc}', Mins='{minutes}', Priority='{priority}'")
+        if title:
+            try:
+                # Sanitize input
+                cleaned_mins = str(minutes).strip().replace('\n', '')
+                try:
+                    mins = int(cleaned_mins) if cleaned_mins else 0
+                except ValueError:
+                    mins = 0
                 
-        return res
+                app = App.get_running_app()
+                app.db.assign_task(self.emp_id, title, desc, mins, priority)
+                if app.sm.current == 'manager_dashboard':
+                    app.manager_screen._load_all_assigned_tasks()
+            except Exception as e:
+                print(f"[AssignTaskPopup Error] {e}")
+                from kivy.uix.label import Label
+                Popup(title="Database Error", content=Label(text=str(e)), size_hint=(0.8, 0.4)).open()
+        self.dismiss()
 
-    @Slot(str, str, str)
-    def create_employee(self, name, emp_id, password):
-        self.engine.db.create_employee(name, emp_id, password)
+class EditTaskPopup(Popup):
+    task_id = NumericProperty(0)
+    emp_options = ListProperty(["Keep Current"])
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        app = App.get_running_app()
+        emps = app.db.get_all_employees()
+        self.emp_options = ["Keep Current"] + [f"{e['id']} - {e['name']}" for e in emps]
+        
+    def do_save(self, title, desc, minutes, priority="Medium", reassign="Keep Current"):
+        print(f"[EditTaskPopup] Saving task_id={self.task_id}, Title='{title}', Desc='{desc}', Mins='{minutes}', Priority='{priority}'")
+        if title:
+            try:
+                # Sanitize input
+                cleaned_mins = str(minutes).strip().replace('\n', '')
+                try:
+                    mins = int(cleaned_mins) if cleaned_mins else 0
+                except ValueError:
+                    mins = 0
+                
+                app = App.get_running_app()
+                app.db.update_assigned_task(self.task_id, title, desc, mins, priority)
+                
+                if reassign != "Keep Current":
+                    new_id = int(reassign.split(' - ')[0])
+                    app.db.reassign_task(self.task_id, new_id)
+                
+                if hasattr(app, 'manager_screen') and app.sm.current == 'manager_dashboard':
+                    app.manager_screen._load_all_assigned_tasks()
+                if hasattr(app, 'employee_screen') and app.sm.current == 'employee_portal':
+                    app.employee_screen._load_assigned_tasks()
+                app.db._broadcast_employees()
+            except Exception as e:
+                print(f"[EditTaskPopup Error] {e}")
+                from kivy.uix.label import Label
+                Popup(title="Database Error", content=Label(text=str(e)), size_hint=(0.8, 0.4)).open()
+        self.dismiss()
 
-    @Slot(str, str, str, int)
-    def assign_task(self, emp_id, title, description, allocated_time):
-        from firebase_admin import firestore
-        try:
-            if not emp_id or not title:
-                print("Error: Missing Employee ID or Title")
-                return
-            task_data = {
-                'emp_id': str(emp_id),
-                'user_id': str(emp_id),
-                'title': title,
-                'description': description,
-                'allocated_minutes': allocated_time,
-                'status': 'pending',
-                'created_at': firestore.SERVER_TIMESTAMP
-            }
-            self.engine.db.db.collection('assigned_tasks').add(task_data)
-            self.engine.db.log_activity(f"Manager assigned task '{title}' ({allocated_time}m) to Employee ID: {emp_id}", datetime.now().strftime("%I:%M %p"))
-            print(f"Success: Task '{title}' assigned to {emp_id}")
-        except Exception as e:
-            print(f"CRITICAL ERROR assigning task: {e}")
+class ForgotPasswordPopup(Popup):
+    def do_reset(self, username, new_password):
+        if username and new_password:
+            app = App.get_running_app()
+            success = app.db.update_employee_password(username, new_password)
+            if success:
+                print(f"[ForgotPassword] Reset successful for {username}")
+                from kivy.uix.label import Label
+                Popup(title="Success", content=Label(text="Password reset successfully!"), size_hint=(0.8, 0.4)).open()
+            else:
+                print(f"[ForgotPassword] User {username} not found")
+                from kivy.uix.label import Label
+                Popup(title="Error", content=Label(text="User not found!"), size_hint=(0.8, 0.4)).open()
+        self.dismiss()
 
-    @Slot(str)
-    def delete_employee(self, emp_id):
-        self.engine.db.delete_employee(emp_id)
+class ForceStatusPopup(Popup):
+    emp_id = NumericProperty(0)
+    def set_status(self, new_status):
+        app = App.get_running_app()
+        app.db.force_employee_status(self.emp_id, new_status)
+        self.dismiss()
 
-    @Slot(result=str)
+    def reset_timer(self):
+        app = App.get_running_app()
+        app.db.reset_employee_timer(self.emp_id)
+        self.dismiss()
+
+class AdminUserItem(BoxLayout):
+    emp_id = NumericProperty(0)
+    username = StringProperty('')
+    role = StringProperty('')
+
+class ManagerTaskItem(BoxLayout):
+    task_id = NumericProperty(0)
+    emp_name = StringProperty('')
+    title = StringProperty('')
+    description = StringProperty('')
+    allocated_time = NumericProperty(0)
+    status = StringProperty('')
+
+# Screens
+class LoginScreen(Screen):
+    error_text = StringProperty('')
+    
+    def do_login(self):
+        username = self.ids.username_input.text
+        password = self.ids.password_input.text
+        remember = self.ids.remember_me.active
+        app = App.get_running_app()
+        user_info = app.db.authenticate_user(username, password)
+        if user_info:
+            user_id, role, name = user_info
+            
+            if remember:
+                try:
+                    with open('session.json', 'w') as f:
+                        json.dump({'user_id': user_id, 'role': role, 'username': username}, f)
+                except Exception as e:
+                    print("Error saving session:", e)
+                    
+            if role in ('manager', 'admin'):
+                app.sm.current = 'manager_dashboard'
+            else:
+                app.employee_screen.load_user(user_id)
+                app.sm.current = 'employee_portal'
+            self.ids.password_input.text = ''
+        else:
+            self.error_text = 'Invalid credentials.'
+
+class EmployeeScreen(Screen):
+    current_tab = NumericProperty(0)
+    employee_name = StringProperty('')
+    employee_id_str = StringProperty('')
+    employee_department = StringProperty('')
+    timer_text = StringProperty('00:00:00')
+    has_active_task = BooleanProperty(False)
+    is_paused = BooleanProperty(False)
+    current_task_name = StringProperty('None')
+    completed_count = StringProperty('0')
+    avg_time_text = StringProperty('0m')
+    adherence_text = StringProperty('0%')
+    emp_id = NumericProperty(0)
+    
+    def on_pre_enter(self):
+        self.current_tab = 0
+        if self.emp_id:
+            self.load_user(self.emp_id)
+
+    def on_enter(self):
+        from kivy.clock import Clock
+        self.poll_event = Clock.schedule_interval(self._poll_employee_data, 2)
+
+    def on_leave(self):
+        if hasattr(self, 'poll_event') and self.poll_event:
+            self.poll_event.cancel()
+
+    def _poll_employee_data(self, dt):
+        if self.emp_id:
+            self._load_assigned_tasks()
+            self._refresh_stats()
+            self._update_ui_state()
+
+    def on_current_tab(self, instance, value):
+        if 'sm' in self.ids:
+            self.ids.sm.current = 'dashboard' if value == 0 else 'profile'
+
+    def load_user(self, emp_id):
+        self.emp_id = emp_id
+        app = App.get_running_app()
+        if emp_id in app.engine.employees:
+            emp = app.engine.employees[emp_id]
+            self.employee_name = emp['name']
+            self.employee_id_str = f"EMP-{emp_id:04d}"
+            self.employee_department = emp.get('department') or 'N/A'
+            self._update_ui_state()
+        self._refresh_stats()
+        self._load_assigned_tasks()
+
+    def _load_assigned_tasks(self):
+        app = App.get_running_app()
+        tasks = app.db.get_pending_assigned_tasks(self.emp_id)
+        if 'assigned_tasks_container' in self.ids:
+            container = self.ids.assigned_tasks_container
+            container.clear_widgets()
+            for t in tasks:
+                item = AssignedTaskItem(
+                    title=t.get('title', 'Task'),
+                    description=t.get('description', ''),
+                    allocated_time=t.get('allocated_minutes', 0),
+                    task_id=t.get('id', 0)
+                )
+                container.add_widget(item)
+
+    def _update_ui_state(self):
+        app = App.get_running_app()
+        if self.emp_id in app.engine.employees:
+            emp = app.engine.employees[self.emp_id]
+            self.has_active_task = emp['status'] in ['Active', 'Paused', 'On Break'] and emp['task'] != 'None'
+            self.is_paused = emp['status'] in ['Paused', 'On Break']
+            self.current_task_name = emp['task']
+            allocated = emp.get('allocated_minutes', 0)
+            if allocated > 0:
+                remaining = max(0, (allocated * 60) - emp['acc_sec'])
+                self.timer_text = app.engine._format_time(remaining)
+            else:
+                self.timer_text = app.engine._format_time(emp['acc_sec'])
+
+    def pause_task(self):
+        App.get_running_app().db.update_user_status(self.emp_id, "On Break")
+    
+    def resume_task(self):
+        App.get_running_app().db.update_user_status(self.emp_id, "Active")
+
+    def open_end_task_popup(self):
+        popup = CompletionNotesPopup()
+        popup.open()
+
+    def execute_end_task(self, notes="Completed"):
+        app = App.get_running_app()
+        sec = app.engine.employees[self.emp_id]["acc_sec"]
+        task_id = app.db.get_active_task_id(self.emp_id)
+        if task_id:
+            app.db.end_task(task_id, self.emp_id, sec, notes)
+        self._refresh_stats()
+        self._load_assigned_tasks()
+
+    def start_assigned_task(self, task_id, allocated_time, title):
+        app = App.get_running_app()
+        if self.has_active_task:
+            self.execute_end_task("Ended to start new task")
+        app.db.start_task(self.emp_id, title, allocated_minutes=allocated_time)
+        
+        import sqlite3
+        with sqlite3.connect(app.db.db_path) as conn:
+            c = conn.cursor()
+            c.execute("UPDATE assigned_tasks SET status='in_progress' WHERE id=?", (task_id,))
+            conn.commit()
+        
+        self._load_assigned_tasks()
+
+    def _refresh_stats(self):
+        app = App.get_running_app()
+        stats = app.db.get_productivity_stats(self.emp_id)
+        self.completed_count = stats['total_completed']
+        self.avg_time_text = stats['avg_time']
+        self.adherence_text = stats['adherence']
+        
+        # Load completed tasks
+        recent = app.db.get_recent_completed_tasks(self.emp_id, limit=5)
+        if 'task_history_container' in self.ids:
+            container = self.ids.task_history_container
+            container.clear_widgets()
+            for t in recent:
+                item = CompletedTaskItem(
+                    task_title=t.get('title', ''),
+                    task_duration=t.get('duration', ''),
+                    task_date=t.get('date', '')
+                )
+                container.add_widget(item)
+
+class ManagerScreen(Screen):
+    current_tab = NumericProperty(0)
+    active_count = NumericProperty(0)
+    break_count = NumericProperty(0)
+    completed_count = NumericProperty(0)
+    
+    def on_pre_enter(self):
+        self.current_tab = 0
+        app = App.get_running_app()
+        app.db._broadcast_employees()
+        app.db._broadcast_activity()
+        self._load_all_assigned_tasks()
+        self._poll_dashboard_data(0)
+        
+    def on_enter(self):
+        from kivy.clock import Clock
+        self.poll_event = Clock.schedule_interval(self._poll_dashboard_data, 2)
+        
+    def on_leave(self):
+        if hasattr(self, 'poll_event') and self.poll_event:
+            self.poll_event.cancel()
+            
+    def _poll_dashboard_data(self, dt):
+        app = App.get_running_app()
+        self.active_count = app.db.get_active_employees_count()
+        self.break_count = app.db.get_on_break_employees_count()
+        self.completed_count = app.db.get_total_completed_tasks()
+        app.db._broadcast_employees()
+        self._load_all_assigned_tasks()
+        
+    def _load_all_assigned_tasks(self):
+        app = App.get_running_app()
+        tasks = app.db.get_all_assigned_tasks()
+        container = self.ids.manager_assigned_tasks_container
+        container.clear_widgets()
+        for t in tasks:
+            item = ManagerTaskItem(
+                task_id=t.get('id', 0),
+                emp_name=t.get('emp_name') or 'Unknown',
+                title=t.get('title', 'Task'),
+                description=t.get('description', ''),
+                allocated_time=t.get('allocated_minutes', 0),
+                status=t.get('status', 'pending')
+            )
+            container.add_widget(item)
+            
+    def on_current_tab(self, instance, value):
+        if 'manager_sm' in self.ids:
+            if value == 0:
+                self.ids.manager_sm.current = 'team_status'
+            elif value == 1:
+                self.ids.manager_sm.current = 'task_management'
+            elif value == 2:
+                self.ids.manager_sm.current = 'system_logs'
+            elif value == 3:
+                self.ids.manager_sm.current = 'admin_control'
+
+class TeamPulseApp(App):
+    def build(self):
+        self.db = DatabaseManager()
+        self.engine = TeamPulseEngine(self.db)
+        
+        self.engine.bind(
+            on_employee_timer_updated=self._on_timer_updated,
+            on_employee_status_changed=self._on_status_changed,
+            on_metrics_updated=self._on_metrics_updated,
+            on_employees_synced=self._on_employees_synced,
+            on_activity_feed_changed=self._on_activity_feed_changed
+        )
+        
+        self.sm = ScreenManager()
+        
+        self.login_screen = LoginScreen(name='login_screen')
+        self.employee_screen = EmployeeScreen(name='employee_portal')
+        self.manager_screen = ManagerScreen(name='manager_dashboard')
+        
+        self.sm.add_widget(self.login_screen)
+        self.sm.add_widget(self.employee_screen)
+        self.sm.add_widget(self.manager_screen)
+        
+        # Auto-login if remember me session exists
+        if os.path.exists('session.json'):
+            try:
+                with open('session.json', 'r') as f:
+                    session = json.load(f)
+                role = session.get('role')
+                user_id = session.get('user_id')
+                if role in ('manager', 'admin'):
+                    self.sm.current = 'manager_dashboard'
+                else:
+                    self.employee_screen.load_user(user_id)
+                    self.sm.current = 'employee_portal'
+            except Exception as e:
+                print("Error loading session:", e)
+                
+        return self.sm
+
+    def logout(self):
+        self.sm.current = 'login_screen'
+        if os.path.exists('session.json'):
+            try:
+                os.remove('session.json')
+            except:
+                pass
+        
+    def open_forgot_password(self):
+        ForgotPasswordPopup().open()
+        
+    def open_force_status_popup(self, emp_id):
+        popup = ForceStatusPopup()
+        popup.emp_id = emp_id
+        popup.open()
+        
     def export_logs(self):
-        import csv
-        import os
-        from firebase_admin import firestore
-        filename = "activity_logs.csv"
-        docs = self.engine.db.collection('activity_feed').order_by('timestamp_raw', direction=firestore.Query.DESCENDING).get()
-        with open(filename, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(["Timestamp", "Message"])
-            for doc in docs:
-                data = doc.to_dict()
-                writer.writerow([data.get('timestamp', ''), data.get('message', '')])
-        return os.path.abspath(filename)
+        try:
+            filepath = "activity_logs_export.csv"
+            self.db.export_logs_to_file(filepath)
+            print(f"[Export] Logs exported to {filepath}")
+            from kivy.uix.label import Label
+            Popup(title="Success", content=Label(text=f"Logs exported to {filepath}"), size_hint=(0.8, 0.4)).open()
+        except Exception as e:
+            print(f"[Export Error] {e}")
+            from kivy.uix.label import Label
+            Popup(title="Error", content=Label(text=str(e)), size_hint=(0.8, 0.4)).open()
+        
+    def open_add_user_popup(self):
+        popup = AddEmployeePopup()
+        popup.open()
+        
+    def assign_task(self, emp_id):
+        popup = AssignTaskPopup()
+        popup.emp_id = emp_id
+        popup.open()
+        
+    def edit_assigned_task(self, task_id, title, desc, mins):
+        popup = EditTaskPopup()
+        popup.task_id = task_id
+        popup.ids.task_title.text = title
+        popup.ids.task_desc.text = desc
+        popup.ids.task_mins.text = str(mins)
+        popup.open()
+        
+    def force_complete_task(self, task_id):
+        self.db.force_complete_task(task_id)
+        if hasattr(self, 'manager_screen') and self.sm.current == 'manager_dashboard':
+            self.manager_screen._load_all_assigned_tasks()
+        if hasattr(self, 'employee_screen') and self.sm.current == 'employee_portal':
+            self.employee_screen._load_assigned_tasks()
+        self.db._broadcast_employees()
 
+    def delete_assigned_task_manager(self, task_id):
+        self.db.delete_assigned_task(task_id)
+        if hasattr(self, 'manager_screen') and self.sm.current == 'manager_dashboard':
+            self.manager_screen._load_all_assigned_tasks()
+        if hasattr(self, 'employee_screen') and self.sm.current == 'employee_portal':
+            self.employee_screen._load_assigned_tasks()
+        self.db._broadcast_employees()
+        
+    def delete_employee(self, emp_id):
+        self.db.delete_employee(emp_id)
+
+    def _on_timer_updated(self, instance, emp_id, timer_text):
+        if self.sm.current == 'employee_portal' and self.employee_screen.emp_id == emp_id:
+            self.employee_screen.timer_text = timer_text
+            
+        # Update specific employee card on manager screen dynamically
+        if hasattr(self, 'manager_screen') and 'employee_list' in self.manager_screen.ids:
+            for card in self.manager_screen.ids.employee_list.children:
+                if getattr(card, 'emp_id', None) == emp_id:
+                    card.emp_timer = timer_text
+
+    def _on_status_changed(self, instance, emp_id, task, status, completed_list):
+        if self.sm.current == 'employee_portal' and self.employee_screen.emp_id == emp_id:
+            self.employee_screen._update_ui_state()
+
+    def _on_metrics_updated(self, instance, active, paused, completed):
+        if hasattr(self, 'manager_screen'):
+            self.manager_screen.active_count = active
+            self.manager_screen.break_count = paused
+            self.manager_screen.completed_count = completed
+
+    def _on_employees_synced(self, instance, users_data):
+        if not hasattr(self, 'manager_screen'):
+            return
+        if 'employee_list' in self.manager_screen.ids:
+            emp_list = self.manager_screen.ids.employee_list
+            emp_list.clear_widgets()
+            for user in users_data:
+                acc_sec = user['acc_sec']
+                allocated = user.get('allocated_minutes', 0) or 0
+                if allocated > 0:
+                    rem = max(0, (allocated * 60) - acc_sec)
+                    t_str = self.engine._format_time(rem)
+                else:
+                    t_str = self.engine._format_time(acc_sec)
+                card = EmployeeCard(
+                    emp_id=user['id'],
+                    emp_name=user['name'],
+                    emp_status=user.get('status', 'Offline'),
+                    emp_task=user.get('current_task', 'None'),
+                    emp_timer=t_str
+                )
+                emp_list.add_widget(card)
+            
+        if 'admin_user_list' in self.manager_screen.ids:
+            admin_list = self.manager_screen.ids.admin_user_list
+            admin_list.clear_widgets()
+            all_emps = self.db.get_all_employees()
+            for emp in all_emps:
+                item = AdminUserItem(
+                    emp_id=emp['id'],
+                    username=emp['username'],
+                    role=emp['role']
+                )
+                admin_list.add_widget(item)
+
+    def _on_activity_feed_changed(self, instance, activity_data):
+        if hasattr(self, 'manager_screen') and 'activity_feed' in self.manager_screen.ids:
+            feed = self.manager_screen.ids.activity_feed
+            feed.clear_widgets()
+            for act in activity_data:
+                item = ActivityItem(
+                    message=act.get('message', ''),
+                    timestamp=act.get('timestamp', '')
+                )
+                feed.add_widget(item)
 
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    engine = QQmlApplicationEngine()
-    
-    def handle_qml_error(obj, url):
-        if obj is None:
-            print(f"CRITICAL ERROR: Failed to load QML file: {url.toString()}")
-            sys.exit(-1)
-            
-    engine.objectCreated.connect(handle_qml_error)
-    
-    # Instantiate the Database and Auth
-    db_manager = DatabaseManager()
-    auth_controller = AuthController(db_manager)
-    
-    # Instantiate the Global State Engine
-    tp_engine = TeamPulseEngine(db_manager)
-    tp_engine.setParent(app)
-    
-    # Instantiate Models
-    emp_model = EmployeeStatusModel()
-    emp_model.setParent(app)
-    feed_model = ActivityFeedModel()
-    feed_model.setParent(app)
-    history_model = TaskHistoryModel()
-    history_model.setParent(app)
-    
-    # Instantiate Controllers connected to the Engine
-    employee_controller = EmployeeController(tp_engine, history_model)
-    employee_controller.setParent(app)
-    manager_controller = ManagerController(tp_engine, emp_model, feed_model)
-    manager_controller.setParent(app)
-    
-    # Expose to QML before rendering
-    engine.rootContext().setContextProperty("authController", auth_controller)
-    engine.rootContext().setContextProperty("employeeController", employee_controller)
-    engine.rootContext().setContextProperty("managerController", manager_controller)
-    engine.rootContext().setContextProperty("employeeStatusModel", emp_model)
-    engine.rootContext().setContextProperty("activityFeedModel", feed_model)
-    
-    qml_file = str((Path(__file__).parent / "main.qml").resolve())
-    engine.load(qml_file)
-    
-    if not engine.rootObjects():
-        print("CRITICAL ERROR: No root objects found.")
-        sys.exit(-1)
-        
-    QTimer.singleShot(100, tp_engine.initialize_heavy_data)
-    
-    sys.exit(app.exec())
+    TeamPulseApp().run()

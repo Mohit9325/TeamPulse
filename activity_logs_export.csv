@@ -1,0 +1,31 @@
+ID,Message,Timestamp,Raw Timestamp
+30,Task ID 7 manually forced to Completed by Manager,05:03 PM,2026-08-27T17:03:04.163513
+29,Task ID 6 manually forced to Completed by Manager,04:33 PM,2026-08-27T16:33:57.950565
+28,Task ID 5 manually forced to Completed by Manager,04:33 PM,2026-08-27T16:33:57.477104
+27,Task ID 3 manually forced to Completed by Manager,04:33 PM,2026-08-27T16:33:56.964287
+26,Task ID 2 manually forced to Completed by Manager,04:33 PM,2026-08-27T16:33:56.817994
+25,Task ID 2 manually forced to Completed by Manager,04:33 PM,2026-08-27T16:33:56.404839
+24,Task ID 1 manually forced to Completed by Manager,04:33 PM,2026-08-27T16:33:56.184752
+23,Task ID 1 manually forced to Completed by Manager,04:33 PM,2026-08-27T16:33:55.799005
+22,Task ID 1 manually forced to Completed by Manager,04:33 PM,2026-08-27T16:33:55.622464
+21,Task ID 1 manually forced to Completed by Manager,04:33 PM,2026-08-27T16:33:54.950793
+20,Assigned task 'task 2' [Low] to Employee ID 2,04:33 PM,2026-08-27T16:33:49.914963
+19,Task ID 5 manually forced to Completed by Manager,04:26 PM,2026-08-27T16:26:41.639705
+18,Task ID 6 manually forced to Completed by Manager,04:26 PM,2026-08-27T16:26:29.349780
+17,Task ID 3 manually forced to Completed by Manager,04:26 PM,2026-08-27T16:26:28.492856
+16,Task ID 2 manually forced to Completed by Manager,04:26 PM,2026-08-27T16:26:27.867372
+15,Task ID 1 manually forced to Completed by Manager,04:26 PM,2026-08-27T16:26:27.233160
+14,Task ID 1 manually forced to Completed by Manager,04:26 PM,2026-08-27T16:26:25.880599
+13,Manager forced status of Employee ID 2 to On Break,04:22 PM,2026-08-27T16:22:05.177311
+12,Manager forced status of Employee ID 2 to Active,04:21 PM,2026-08-27T16:21:57.169661
+11,Manager forced status of Employee ID 2 to Offline,04:21 PM,2026-08-27T16:21:54.395961
+10,Manager assigned task 'Development' to Employee ID 2,03:57 PM,2026-08-27T15:57:05.078698
+9,Manager updated assigned task ID: 5,03:39 PM,2026-08-27T15:39:20.626144
+8,Manager deleted assigned task ID: 4,03:34 PM,2026-08-27T15:34:18.496584
+7,Manager assigned task 'task1' to Employee ID 2,03:34 PM,2026-08-27T15:34:13.814896
+6,Manager deleted employee ID: 6,03:32 PM,2026-08-27T15:32:46.148968
+5,Manager assigned task 'task1' to Employee ID 2,03:32 PM,2026-08-27T15:32:04.735463
+4,Assigned task 'Admin' to 2,02:27 PM,2026-08-27T14:27:55.269222
+3,Assigned task 'Development' to 2,02:17 PM,2026-08-27T14:17:06.697689
+2,Manager created new employee: Harsh,02:14 PM,2026-08-27T14:14:48.889216
+1,Assigned task 'Development' to 2,02:14 PM,2026-08-27T14:14:31.672416
